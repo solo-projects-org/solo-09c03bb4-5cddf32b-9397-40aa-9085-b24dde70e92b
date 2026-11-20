@@ -64,6 +64,11 @@ class StubSource:
             end_minute=end_minute,
         )
 
+    def switch_version_sync(self, version: str) -> None:
+        import asyncio
+
+        asyncio.run(self.state.switch_version(version))
+
 
 @pytest.fixture()
 def source_state() -> SourceState:
@@ -85,3 +90,13 @@ def stub(source_state: SourceState) -> StubSource:
 @pytest.fixture()
 def collector(db: Database, stub: StubSource) -> Collector:
     return Collector(db, stub)
+
+
+def collect_until_settled(collector: Collector, day, max_rounds: int = 25):
+    """Drive collection rounds until the day has no pending frontier left."""
+    last = None
+    for _ in range(max_rounds):
+        last = collector.run_round(day)
+        if last.status in {"collected", "needs_manual_review"}:
+            return last
+    raise AssertionError(f"day {day} never settled: {last}")

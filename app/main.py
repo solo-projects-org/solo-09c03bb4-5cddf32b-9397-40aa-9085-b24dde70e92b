@@ -7,13 +7,25 @@ from datetime import date
 
 from fastapi import FastAPI, HTTPException
 
+from app.citations import CitationService, CitationValidation
 from app.collector import Collector, DayBusy, RoundResult
 from app.config import settings
-from app.db import Database
+from app.db import (
+    Citation,
+    CitationEvidence,
+    CitationMismatch,
+    Database,
+    ReportAlreadyRegistered,
+)
 from app.schemas import (
+    CitationOut,
+    CitationRegisterIn,
+    CitationRegisterOut,
+    CitationTraceOut,
     CollectRequest,
     CollectResponse,
     DayCoverageOut,
+    EvidenceOut,
     ManualRangeOut,
     NoticeOut,
     range_out,
@@ -23,10 +35,17 @@ from common.times import parse_archive_date
 
 
 class AppState:
-    def __init__(self, db: Database, client: SourceClient, collector: Collector) -> None:
+    def __init__(
+        self,
+        db: Database,
+        client: SourceClient,
+        collector: Collector,
+        citations: CitationService,
+    ) -> None:
         self.db = db
         self.client = client
         self.collector = collector
+        self.citations = citations
 
 
 def build_state() -> AppState:
@@ -34,7 +53,10 @@ def build_state() -> AppState:
     db.init()
     client = SourceClient(settings.source_base_url, settings.source_timeout_seconds)
     collector = Collector(db, client, settings.max_round_queries)
-    return AppState(db=db, client=client, collector=collector)
+    citations = CitationService(db)
+    return AppState(
+        db=db, client=client, collector=collector, citations=citations
+    )
 
 
 def set_state_for_tests(state: AppState) -> None:
@@ -55,12 +77,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Environmental disclosure archive",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Bounded continuation collection over a versioned disclosure source. "
         "Rounds verify the day version first, then search at most six minute "
         "intervals. Fewer than five results closes an interval; a full page "
-        "splits it; a full single minute is left for manual review."
+        "splits it; a full single minute is left for manual review. "
+        "Monthly-report citation lists can be registered against the submitted "
+        "archive and later traced for revisions or withdrawals of cited notices."
     ),
     lifespan=lifespan,
 )
@@ -163,6 +187,73 @@ def version_view(day: str) -> dict[str, str | None]:
     state = archive()
     record = state.db.get_day_record(parsed)
     return {"day": day, "day_version": record.day_version}
+
+
+# --------------------------------------------------------------- citations
+
+
+def _citation_out(citation: Citation) -> CitationOut:
+    return CitationOut(
+        day=citation.day.isoformat(),
+        announcement_no=citation.announcement_no,
+        title=citation.title,
+        published_at=citation.published_at,
+        day_version=citation.day_version,
+        registered_at=citation.created_at,
+    )
+
+
+def _evidence_out(evidence: CitationEvidence) -> EvidenceOut:
+    return EvidenceOut(
+        day=evidence.day.isoformat(),
+        announcement_no=evidence.announcement_no,
+        reason=evidence.reason,
+        day_version=evidence.day_version,
+        new_title=evidence.new_title,
+        new_published_at=evidence.new_published_at,
+        detected_at=evidence.created_at,
+    )
+
+
+@app.post("/api/citation-registrations", response_model=CitationRegisterOut, status_code=201)
+def register_citations(payload: CitationRegisterIn) -> CitationRegisterOut:
+    state = archive()
+    entries = [entry.model_dump() for entry in payload.citations]
+    try:
+        citations = state.citations.register(payload.report_no, entries)
+    except CitationValidation as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ReportAlreadyRegistered as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CitationMismatch as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "citation list does not match the submitted archive",
+                "errors": exc.errors,
+            },
+        ) from exc
+    return CitationRegisterOut(
+        report_no=payload.report_no,
+        citations=[_citation_out(c) for c in citations],
+    )
+
+
+@app.get("/api/citation-registrations/{report_no}", response_model=CitationTraceOut)
+def trace_citations(report_no: str) -> CitationTraceOut:
+    state = archive()
+    result = state.citations.trace(report_no)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no citation registration for report {report_no}",
+        )
+    citations, evidence = result
+    return CitationTraceOut(
+        report_no=report_no,
+        citations=[_citation_out(c) for c in citations],
+        evidence=[_evidence_out(e) for e in evidence],
+    )
 
 
 __all__ = [

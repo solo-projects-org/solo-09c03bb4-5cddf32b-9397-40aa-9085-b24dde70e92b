@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import source.main as source_main
+from app.citations import CitationService
 from app.db import Database
 from app.main import AppState, set_state_for_tests
 from app.main import app as archive_app
@@ -65,7 +66,12 @@ def archive_client(tmp_path: Path, source_app):
     db = Database(tmp_path / "api.sqlite3")
     db.init()
     client = SourceClient("http://source", timeout=5.0, transport=SyncASGITransport(source_app))
-    state = AppState(db=db, client=client, collector=Collector(db, client))
+    state = AppState(
+        db=db,
+        client=client,
+        collector=Collector(db, client),
+        citations=CitationService(db),
+    )
     set_state_for_tests(state)
     with TestClient(archive_app) as test_client:
         yield test_client
@@ -195,7 +201,12 @@ def test_restart_resumes_pending_work(
     db = Database(tmp_path / "api.sqlite3")
     db.init()
     client = SourceClient("http://source", 5.0, transport=SyncASGITransport(source_app))
-    state = AppState(db=db, client=client, collector=Collector(db, client))
+    state = AppState(
+        db=db,
+        client=client,
+        collector=Collector(db, client),
+        citations=CitationService(db),
+    )
     set_state_for_tests(state)
     try:
         after = archive_client.get("/api/days/2026-11-20").json()
@@ -211,3 +222,138 @@ def test_version_endpoint_reports_archive_version(archive_client: TestClient) ->
     collect(archive_client, "2026-11-18")
     body = archive_client.get("/api/days/2026-11-18/version").json()
     assert body == {"day": "2026-11-18", "day_version": "2026-11-18.v1"}
+
+
+# ------------------------------------------------------------- citation API
+
+
+CITATION_PAYLOAD = {
+    "report_no": "EIA-MONTHLY-2026-11",
+    "citations": [
+        {
+            "day": "2026-11-19",
+            "announcement_no": "HB-EIA-2026-1119-01",
+            "title": "云岭风电场二期工程环境影响报告书公示",
+            "published_at": "2026-11-19T08:00:00Z",
+        },
+        {
+            "day": "2026-11-19",
+            "announcement_no": "HB-EIA-2026-1119-02",
+            "title": "青石镇污水处理厂提标改造竣工验收公示",
+            "published_at": "2026-11-19T12:00:00Z",
+        },
+    ],
+}
+
+
+def test_citation_endpoints_in_openapi(archive_client: TestClient) -> None:
+    schema = archive_client.get("/openapi.json").json()
+    assert "/api/citation-registrations" in schema["paths"]
+    assert "/api/citation-registrations/{report_no}" in schema["paths"]
+    assert archive_client.get("/docs").status_code == 200
+
+
+def test_citation_registration_and_trace_full_flow(
+    archive_client: TestClient, source_app
+) -> None:
+    # Registering before any archive exists is rejected, with nothing stored.
+    rejected = archive_client.post(
+        "/api/citation-registrations", json=CITATION_PAYLOAD
+    )
+    assert rejected.status_code == 409
+    assert "errors" in rejected.json()["detail"]
+    assert (
+        archive_client.get("/api/citation-registrations/EIA-MONTHLY-2026-11").status_code
+        == 404
+    )
+
+    # Sparse day settles in one round and matches the citation list.
+    collect(archive_client, "2026-11-19")
+    created = archive_client.post("/api/citation-registrations", json=CITATION_PAYLOAD)
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["report_no"] == "EIA-MONTHLY-2026-11"
+    assert [c["announcement_no"] for c in body["citations"]] == [
+        "HB-EIA-2026-1119-01",
+        "HB-EIA-2026-1119-02",
+    ]
+    assert all(c["day_version"] == "2026-11-19.v1" for c in body["citations"])
+
+    # A second registration of the same report number conflicts.
+    duplicate = archive_client.post(
+        "/api/citation-registrations", json=CITATION_PAYLOAD
+    )
+    assert duplicate.status_code == 409
+
+    # Malformed payloads are 422, not 409.
+    bad = {"report_no": "X", "citations": []}
+    assert archive_client.post("/api/citation-registrations", json=bad).status_code == 422
+
+    # Switch the source to v2 and re-collect: one cited notice is revised.
+    with httpx.Client(
+        base_url="http://source", transport=SyncASGITransport(source_app)
+    ) as http:
+        assert http.post("/v1/admin/version", json={"version": "v2"}).status_code == 200
+    collect(archive_client, "2026-11-19")
+    collect(archive_client, "2026-11-19")
+
+    trace = archive_client.get(
+        "/api/citation-registrations/EIA-MONTHLY-2026-11"
+    ).json()
+    # Original citations are returned verbatim...
+    assert trace["citations"][0]["title"] == "云岭风电场二期工程环境影响报告书公示"
+    # ...and the first confirmed revision is attached as evidence.
+    assert len(trace["evidence"]) == 1
+    evidence = trace["evidence"][0]
+    assert evidence["reason"] == "revised"
+    assert evidence["day_version"] == "2026-11-19.v2"
+    assert evidence["announcement_no"] == "HB-EIA-2026-1119-01"
+    assert evidence["new_title"] == "云岭风电场二期工程环境影响报告书公示（修订版）"
+    assert evidence["new_published_at"] == "2026-11-19T08:00:00Z"
+
+
+def test_citation_registration_mismatch_is_409(archive_client: TestClient) -> None:
+    collect(archive_client, "2026-11-19")
+    payload = {
+        "report_no": "EIA-MONTHLY-2026-99",
+        "citations": [
+            {
+                "day": "2026-11-19",
+                "announcement_no": "HB-EIA-2026-1119-01",
+                "title": "与归档不符的标题",
+                "published_at": "2026-11-19T08:00:00Z",
+            }
+        ],
+    }
+    response = archive_client.post("/api/citation-registrations", json=payload)
+    assert response.status_code == 409
+    assert response.json()["detail"]["errors"]
+
+
+def test_citation_registry_survives_restart_over_http(
+    archive_client: TestClient, tmp_path: Path, source_app
+) -> None:
+    collect(archive_client, "2026-11-19")
+    created = archive_client.post(
+        "/api/citation-registrations", json=CITATION_PAYLOAD
+    )
+    assert created.status_code == 201
+
+    db = Database(tmp_path / "api.sqlite3")
+    db.init()
+    client = SourceClient("http://source", 5.0, transport=SyncASGITransport(source_app))
+    state = AppState(
+        db=db,
+        client=client,
+        collector=Collector(db, client),
+        citations=CitationService(db),
+    )
+    set_state_for_tests(state)
+    try:
+        trace = archive_client.get(
+            "/api/citation-registrations/EIA-MONTHLY-2026-11"
+        ).json()
+        assert len(trace["citations"]) == 2
+        assert trace["evidence"] == []
+    finally:
+        client.close()

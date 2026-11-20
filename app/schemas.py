@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from common.times import minute_label
@@ -73,3 +75,89 @@ def range_out(start: int, end: int) -> RangeOut:
         from_time=minute_label(start),
         to_time=minute_label(end),
     )
+
+
+# --------------------------------------------------------------- citations
+
+
+class CitationIn(BaseModel):
+    day: str = Field(
+        description="UTC disclosure day of the cited notice, YYYY-MM-DD",
+        examples=["2026-11-19"],
+    )
+    announcement_no: str = Field(
+        min_length=1,
+        description="Announcement number as shown on the disclosure source",
+        examples=["HB-EIA-2026-1119-01"],
+    )
+    title: str = Field(
+        min_length=1, description="Title recorded in the monthly report"
+    )
+    published_at: str = Field(
+        min_length=1,
+        description="UTC publication time as an ISO-8601 timestamp",
+        examples=["2026-11-19T08:00:00Z"],
+    )
+
+
+class CitationRegisterIn(BaseModel):
+    report_no: str = Field(
+        min_length=1,
+        description="Monthly report number; one registration per report",
+        examples=["EIA-MONTHLY-2026-11"],
+    )
+    citations: list[CitationIn] = Field(
+        min_length=1, description="Full citation list of the monthly report"
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "report_no": "EIA-MONTHLY-2026-11",
+                "citations": [
+                    {
+                        "day": "2026-11-19",
+                        "announcement_no": "HB-EIA-2026-1119-01",
+                        "title": "云岭风电场二期工程环境影响报告书公示",
+                        "published_at": "2026-11-19T08:00:00Z",
+                    },
+                    {
+                        "day": "2026-11-19",
+                        "announcement_no": "HB-EIA-2026-1119-02",
+                        "title": "青石镇污水处理厂提标改造竣工验收公示",
+                        "published_at": "2026-11-19T12:00:00Z",
+                    },
+                ],
+            }
+        }
+    }
+
+
+class CitationOut(BaseModel):
+    day: str
+    announcement_no: str
+    title: str
+    published_at: str
+    day_version: str = Field(description="Day version retained at registration")
+    registered_at: str
+
+
+class EvidenceOut(BaseModel):
+    day: str
+    announcement_no: str
+    reason: Literal["revised", "withdrawn"]
+    day_version: str = Field(description="Day version in which the change was confirmed")
+    new_title: str | None = None
+    new_published_at: str | None = None
+    detected_at: str
+
+
+class CitationRegisterOut(BaseModel):
+    report_no: str
+    citations: list[CitationOut]
+
+
+class CitationTraceOut(BaseModel):
+    report_no: str
+    citations: list[CitationOut]
+    evidence: list[EvidenceOut]

@@ -47,6 +47,49 @@ class DayMissing(RuntimeError):
     """Internal guard: a write referenced a day without a version row."""
 
 
+class CitationMismatch(RuntimeError):
+    """A registration list does not match the currently submitted archive.
+
+    ``errors`` lists every offending citation so the API can reject the whole
+    registration with a precise explanation.
+    """
+
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+class ReportAlreadyRegistered(RuntimeError):
+    """A monthly report number was already registered."""
+
+    def __init__(self, report_no: str) -> None:
+        super().__init__(f"monthly report {report_no} is already registered")
+        self.report_no = report_no
+
+
+@dataclass(frozen=True)
+class Citation:
+    report_no: str
+    day: date
+    announcement_no: str
+    title: str
+    published_at: str
+    day_version: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class CitationEvidence:
+    report_no: str
+    day: date
+    announcement_no: str
+    reason: str
+    day_version: str
+    new_title: str | None
+    new_published_at: str | None
+    created_at: str
+
+
 @dataclass
 class FrontierItem:
     id: int
@@ -122,11 +165,55 @@ CREATE TABLE IF NOT EXISTS notices (
     day_version TEXT NOT NULL,
     PRIMARY KEY (day, announcement_no)
 );
+
+-- Citation registry: one row per cited notice of a monthly report.  A
+-- registration is only accepted when every row matches the currently
+-- submitted archive, and the day version seen at registration is kept.
+CREATE TABLE IF NOT EXISTS citation_registrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_no TEXT NOT NULL,
+    day TEXT NOT NULL,
+    announcement_no TEXT NOT NULL,
+    title TEXT NOT NULL,
+    published_at TEXT NOT NULL,
+    day_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(report_no, day, announcement_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_citations_day
+    ON citation_registrations(day, announcement_no);
+
+-- First confirmed change per citation.  The UNIQUE constraint enforces the
+-- "keep only the first evidence" rule at the storage layer; restoring the
+-- original text in a later version therefore cannot overwrite or delete it.
+CREATE TABLE IF NOT EXISTS citation_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_no TEXT NOT NULL,
+    day TEXT NOT NULL,
+    announcement_no TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    day_version TEXT NOT NULL,
+    new_title TEXT,
+    new_published_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(report_no, day, announcement_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_day
+    ON citation_evidence(day, announcement_no);
 """
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# Evidence reasons.  ``revised`` keeps the new title and published time;
+# ``withdrawn`` means the same-number notice never reappeared once the new
+# version's whole day had been collected.
+REASON_REVISED = "revised"
+REASON_WITHDRAWN = "withdrawn"
 
 
 class Database:
@@ -304,6 +391,10 @@ class Database:
             "UPDATE days SET day_version = ?, updated_at = ? WHERE day = ?",
             (version, now, day_text),
         )
+        # Citation registrations and their evidence are intentionally kept:
+        # the registry records what a monthly report cited, and confirmed
+        # evidence must survive later versions even if the original text is
+        # restored.  Re-collection re-evaluates every citation below.
 
     def _guard_version_locked(
         self, conn: sqlite3.Connection, day_text: str, expected: str
@@ -388,7 +479,13 @@ class Database:
         item: FrontierItem,
         notices: list[Notice],
     ) -> None:
-        """Close a frontier interval, storing its notices atomically."""
+        """Close a frontier interval, storing its notices atomically.
+
+        Citation evidence confirmed by this write is created inside the same
+        transaction: a revision among the newly archived notices, or a
+        withdrawal once the whole new version is settled.  Any failure rolls
+        the archive change and the evidence back together.
+        """
         day_text = day.isoformat()
         now = _utc_now()
         conn = self._connect()
@@ -410,11 +507,15 @@ class Database:
                         expected_version,
                     ),
                 )
+                self._record_revision_locked(conn, day_text, notice, expected_version, now)
             conn.execute(
                 "INSERT INTO completed_ranges("
                 "day, start_minute, end_minute, day_version, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (day_text, item.start_minute, item.end_minute, expected_version, now),
+            )
+            self._record_withdrawals_locked(
+                conn, day_text, expected_version, now, item
             )
             conn.commit()
         except (VersionChanged, StaleVersion):
@@ -522,3 +623,236 @@ class Database:
         return [
             RangeSpec(start, end) for start, end in complement_intervals(occupied)
         ]
+
+    # ------------------------------------------------------------- citations
+
+    def register_citations(
+        self, report_no: str, entries: list[dict[str, str]]
+    ) -> list[Citation]:
+        """Register one monthly report's citation list atomically.
+
+        The whole list must match the currently submitted archive: for every
+        entry the day must be initialised and a notice with the same
+        announcement number, title and ``published_at`` must be archived.  On
+        any mismatch nothing is written and :class:`CitationMismatch` lists
+        every offending citation.  A second registration of the same report
+        number is rejected as :class:`ReportAlreadyRegistered`.
+        """
+        now = _utc_now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT 1 FROM citation_registrations WHERE report_no = ? LIMIT 1",
+                (report_no,),
+            ).fetchone()
+            if existing is not None:
+                raise ReportAlreadyRegistered(report_no)
+
+            errors: list[str] = []
+            rows: list[tuple[str, str, str, str, str, str, str]] = []
+            for index, entry in enumerate(entries):
+                day_text = entry["day"]
+                announcement_no = entry["announcement_no"]
+                title = entry["title"]
+                published_at = entry["published_at"]
+                day_row = conn.execute(
+                    "SELECT day_version FROM days WHERE day = ?", (day_text,)
+                ).fetchone()
+                if day_row is None:
+                    errors.append(
+                        f"citation #{index + 1} ({announcement_no} on {day_text}): "
+                        "that day has no submitted archive yet"
+                    )
+                    continue
+                notice = conn.execute(
+                    "SELECT title, published_at FROM notices "
+                    "WHERE day = ? AND announcement_no = ?",
+                    (day_text, announcement_no),
+                ).fetchone()
+                if notice is None:
+                    errors.append(
+                        f"citation #{index + 1} ({announcement_no} on {day_text}): "
+                        "announcement is not present in the submitted archive"
+                    )
+                elif notice["title"] != title or notice["published_at"] != published_at:
+                    errors.append(
+                        f"citation #{index + 1} ({announcement_no} on {day_text}): "
+                        "title/published_at differ from the submitted archive"
+                    )
+                else:
+                    rows.append(
+                        (
+                            report_no,
+                            day_text,
+                            announcement_no,
+                            title,
+                            published_at,
+                            day_row["day_version"],
+                            now,
+                        )
+                    )
+            if errors:
+                raise CitationMismatch(errors)
+
+            conn.executemany(
+                "INSERT INTO citation_registrations("
+                "report_no, day, announcement_no, title, published_at, "
+                "day_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        except (ReportAlreadyRegistered, CitationMismatch):
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return self.get_citations(report_no)[0]
+
+    def get_citations(
+        self, report_no: str
+    ) -> tuple[list[Citation], list[CitationEvidence]] | None:
+        """Return a report's original citations and confirmed evidence.
+
+        Returns ``None`` when the report number was never registered.
+        """
+        conn = self._connect()
+        try:
+            header = conn.execute(
+                "SELECT 1 FROM citation_registrations WHERE report_no = ? LIMIT 1",
+                (report_no,),
+            ).fetchone()
+            if header is None:
+                return None
+            citations = [
+                Citation(
+                    report_no=r["report_no"],
+                    day=date.fromisoformat(r["day"]),
+                    announcement_no=r["announcement_no"],
+                    title=r["title"],
+                    published_at=r["published_at"],
+                    day_version=r["day_version"],
+                    created_at=r["created_at"],
+                )
+                for r in conn.execute(
+                    "SELECT report_no, day, announcement_no, title, published_at, "
+                    "day_version, created_at FROM citation_registrations "
+                    "WHERE report_no = ? ORDER BY day, announcement_no, id",
+                    (report_no,),
+                )
+            ]
+            evidence = [
+                CitationEvidence(
+                    report_no=r["report_no"],
+                    day=date.fromisoformat(r["day"]),
+                    announcement_no=r["announcement_no"],
+                    reason=r["reason"],
+                    day_version=r["day_version"],
+                    new_title=r["new_title"],
+                    new_published_at=r["new_published_at"],
+                    created_at=r["created_at"],
+                )
+                for r in conn.execute(
+                    "SELECT report_no, day, announcement_no, reason, day_version, "
+                    "new_title, new_published_at, created_at FROM citation_evidence "
+                    "WHERE report_no = ? ORDER BY day, announcement_no, id",
+                    (report_no,),
+                )
+            ]
+        finally:
+            conn.close()
+        return citations, evidence
+
+    def _record_revision_locked(
+        self,
+        conn: sqlite3.Connection,
+        day_text: str,
+        notice: Notice,
+        version: str,
+        now: str,
+    ) -> None:
+        """Record the first revision of a cited same-day same-number notice.
+
+        Only citations without evidence yet are considered, so later versions
+        (including one that restores the original title/time) never overwrite
+        or remove the first confirmation.
+        """
+        matches = conn.execute(
+            "SELECT c.report_no FROM citation_registrations c "
+            "WHERE c.day = ? AND c.announcement_no = ? "
+            "AND (c.title <> ? OR c.published_at <> ?) "
+            "AND NOT EXISTS (SELECT 1 FROM citation_evidence e "
+            "WHERE e.report_no = c.report_no AND e.day = c.day "
+            "AND e.announcement_no = c.announcement_no)",
+            (day_text, notice.announcement_no, notice.title, notice.published_at),
+        ).fetchall()
+        for row in matches:
+            conn.execute(
+                "INSERT INTO citation_evidence("
+                "report_no, day, announcement_no, reason, day_version, "
+                "new_title, new_published_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["report_no"],
+                    day_text,
+                    notice.announcement_no,
+                    REASON_REVISED,
+                    version,
+                    notice.title,
+                    notice.published_at,
+                    now,
+                ),
+            )
+
+    def _record_withdrawals_locked(
+        self,
+        conn: sqlite3.Connection,
+        day_text: str,
+        version: str,
+        now: str,
+        item: FrontierItem,
+    ) -> None:
+        """Record withdrawals once the new version's whole day is settled.
+
+        A missing same-number notice is only evidence after the day has no
+        frontier left and no manual ranges, i.e. the full day was collected.
+        Citations already carrying evidence (an earlier revision, say) keep
+        their first confirmation and are not reclassified.
+        """
+        unsettled = conn.execute(
+            "SELECT 1 FROM frontier_ranges WHERE day = ? LIMIT 1", (day_text,)
+        ).fetchone()
+        if unsettled is not None:
+            return
+        manual = conn.execute(
+            "SELECT 1 FROM manual_ranges WHERE day = ? LIMIT 1", (day_text,)
+        ).fetchone()
+        if manual is not None:
+            return
+        missing = conn.execute(
+            "SELECT c.report_no, c.announcement_no FROM citation_registrations c "
+            "WHERE c.day = ? AND NOT EXISTS (SELECT 1 FROM notices n "
+            "WHERE n.day = c.day AND n.announcement_no = c.announcement_no) "
+            "AND NOT EXISTS (SELECT 1 FROM citation_evidence e "
+            "WHERE e.report_no = c.report_no AND e.day = c.day "
+            "AND e.announcement_no = c.announcement_no)",
+            (day_text,),
+        ).fetchall()
+        for row in missing:
+            conn.execute(
+                "INSERT INTO citation_evidence("
+                "report_no, day, announcement_no, reason, day_version, "
+                "new_title, new_published_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)",
+                (
+                    row["report_no"],
+                    day_text,
+                    row["announcement_no"],
+                    REASON_WITHDRAWN,
+                    version,
+                    now,
+                ),
+            )
